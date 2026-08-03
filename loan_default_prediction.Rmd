@@ -1,0 +1,1159 @@
+---
+title: "Signature Project"
+subtitle: "Loan Default Predictions"
+author: "Rapkin-Stiles, Elias"
+date: "`r Sys.time()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r LoadPackages, echo=FALSE, message=FALSE, warning=FALSE}
+# Load libraries
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(corrplot)
+library(car)
+library(rpart)
+library(e1071)
+library(class)
+library(gbm)
+library(themis)
+library(recipes)
+```
+
+```{r LoadCSV, echo=TRUE}
+# Read CSV from URL
+df <- read.csv("https://raw.githubusercontent.com/eliashrs/Loan-Data/refs/heads/main/loan_data.csv",
+                  stringsAsFactors = FALSE)
+```
+
+This analysis uses the LendingClub loan dataset containing 9,578 loan observations across 14 variables, publicly available on Kaggle at https://www.kaggle.com/datasets/wordsforthewise/lending-club. The data is loaded directly from its GitHub mirror using the URL https://raw.githubusercontent.com/eliashrs/Loan-Data/refs/heads/main/loan_data.csv to ensure accessibility for evaluation. The business objective is to predict loan defaults (not.fully.paid = 1) using ensemble machine learning models to improve lender risk assessment, prioritizing high recall to minimize losses from undetected defaults while maintaining viable precision for operational deployment.
+
+## Clean Data
+
+### Dataframe Structure
+``` {r InspectStructure, echo=TRUE}
+# Print first 5 rows of dataframe
+head(df,5)
+
+# Get dimensions and character types
+d <- dim(df)
+chr_type <- table(sapply(df, class))
+
+# Get dataframe structure
+str(df)
+```
+
+The dataset contains `r d[1]` observations and `r d[2]` variables. By previewing the first few rows with and examining the full structure, I can confirm that all variables loaded correctly and that numeric, integer, and character fields are formatted as expected for downstream preprocessing.
+
+### NA Analysis
+```{r NAanalysis, echo=TRUE}
+# Get NA count by column
+na_counts <- sapply(df, function(x) {
+  if (is.character(x)) {
+    sum(is.na(x) | x == "")
+  } else {
+    sum(is.na(x))
+  }
+})
+
+# Get list of rows with missing data
+null_rows <- which(apply(df, 1, function(row) {
+  any(is.na(row)) || any(row == "", na.rm = TRUE)
+}))
+```
+
+There are `r length(null_rows)` rows with missing data, therefore no data imputation will be necessary.
+
+### Outlier Analysis
+
+``` {r OutlierCount, echo=TRUE}
+# Get list of numeric columns
+num_cols <- c("int.rate", "installment", "log.annual.inc", "dti", "fico", 
+              "days.with.cr.line", "revol.bal", "revol.util")
+
+# Initializes table to store the number of outliers for each column
+outlier_table <- data.frame(
+  
+  # Stores the numeric column names
+  Column = num_cols,
+  
+  # Computes the number of outliers for each column
+  Outliers = sapply(num_cols, function(col) {
+    x <- df[[col]]                    # Extracts the column
+    x <- x[!is.na(x)]                 # Removes NAs from column
+    mu <- mean(x)                     # Computes mean
+    sd_x <- sd(x)                     # Computes standard deviation (STD)
+    sum(abs(x - mu) > 3 * sd_x)       # Counts instances 3+ STD from the mean 
+  })
+)
+
+# Displays table showing number of outliers for each column
+outlier_table
+```
+
+Outliers were identified in several numeric variables using a 3‑standard‑deviation rule. Because tree‑based models (Decision Trees, Random Forests, GBM) are robust to outliers and because removing extreme values could distort the true distribution of borrower behavior, I chose not to remove outliers. Instead, I documented their presence and allowed each algorithm to handle them according to its own inductive bias.
+
+## Explore Data
+
+Exploratory data analysis was performed to understand the distribution and scale of key financial variables. Summary statistics (summary_table) and boxplots revealed substantial variation in income, revolving balance, and credit history length. The correlation matrix indicated moderate relationships among several predictors (e.g., fico, revol.util, int.rate), but no multicollinearity severe enough to require feature removal. This EDA step informed which models would require scaling (Logistic Regression, kNN) and which would not (tree‑based models).
+
+### Numeric Variables
+```{r StatisticalAnalysis, echo=TRUE}
+options(scipen = 999)
+
+# Get all columns with numeric data
+df_num <- df[, num_cols]
+
+# Create summary statistics table for numeric columns
+summary_table <- data.frame(
+  Variable = names(df_num),
+  Mean = sapply(df_num, mean, na.rm = TRUE),
+  Median = sapply(df_num, median, na.rm = TRUE),
+  SD = sapply(df_num, sd, na.rm = TRUE),
+  Min = sapply(df_num, min, na.rm = TRUE),
+  Max = sapply(df_num, max, na.rm = TRUE)
+)
+
+knitr::kable(summary_table, row.names = FALSE, digits = 4)
+```
+
+To understand the distribution of the numeric variables, I created a summary table that reports the mean, median, standard deviation, minimum, and maximum for each numeric feature. This table shows clear differences in scale across predictors: for example, the average interest rate is `r round(mean(df$int.rate), 4)`, while the average FICO score is `r round(mean(df$fico), 1)`, and the mean revolving balance is substantially higher at `r round(mean(df$revol.bal), 1)`. The wide range in days.with.cr.line from `r min(df$days.with.cr.line)` to `r max(df$days.with.cr.line)` highlights the variability in borrower credit histories. These descriptive statistics help identify skewed variables and inform which models require scaling or transformation.
+
+``` {r BoxPlots, echo=TRUE}
+# Create boxplot for each numeric variable
+for (col in num_cols) {
+  boxplot(df[[col]], main = paste("Boxplot of", col), xlab = col,
+          horizontal = TRUE)
+}
+```
+
+To visualize the distribution of each numeric variable, I generated horizontal boxplots for all columns in num_cols. These plots highlight the presence of extreme values, such as the wide spread in revol.bal, which ranges from `r min(df$revol.bal)` to `r max(df$revol.bal)`, and the long right‑tail in days.with.cr.line, extending up to `r max(df$days.with.cr.line)` days. Variables like int.rate and dti show much tighter spreads, with medians around `r median(df$int.rate)` and `r median(df$dti)`, respectively. The boxplots confirm that several predictors are skewed and contain outliers, which is expected in financial data and helps explain why tree‑based models often perform well on this dataset.
+
+```{r CorrelationMatrix, echo=TRUE}
+# Create and display correlation matrix
+cor_matrix <- cor(df[, num_cols], use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.8, addCoef.col = "black")
+
+# Fit linear model on numeric predictors and use VIF to assess multicollinearity
+lm_model <- lm(int.rate ~ ., data = df[, c("int.rate", setdiff(num_cols, "int.rate"))])
+vif(lm_model)
+```
+
+The correlation matrix highlights several moderate relationships among the numeric predictors, such as the association between fico and revol.util (`r round(cor(df$fico, df$revol.util), 3)`) and between int.rate and fico (`r round(cor(df$int.rate, df$fico), 3)`). These correlations are not strong enough to indicate redundancy, which is confirmed by the VIF values from the linear model. All VIF scores fall between `r round(min(vif(lm_model)), 2)` and `r round(max(vif(lm_model)), 2)`, well below common multicollinearity thresholds. This suggests that the numeric predictors do not exhibit problematic linear dependence and can be safely included in downstream modeling without additional dimensionality reduction.
+
+### Categorical Variables
+
+``` {r UniqueValues, echo=TRUE}
+# List of columns with categorical data
+cat_cols <- c("credit.policy", "purpose", "inq.last.6mths", "delinq.2yrs", 
+              "pub.rec", "not.fully.paid")
+
+# Create table displaying number of unique values for categorical columns
+for (col in cat_cols) {
+  tab <- table(df[[col]])
+  cat("Column:", col, "\n")
+  cat("Unique values:", length(tab), "\n")
+  cat("Most common:", names(which.max(tab)), "\n")
+  cat("Count:", max(tab), "\n\n")
+}
+```
+
+``` {r Histograms, echo=TRUE}
+# Create histogram plot for each categorical variable
+for (col in cat_cols) {
+  barplot(table(df[[col]]), main = paste("Bar Plot of", col), xlab = col,
+          ylab = "Count", las = 2)
+}
+```
+
+The barplots for the categorical variables provide a clear view of how frequently each category appears in the dataset. Several variables, such as credit.policy, delinq.2yrs, and pub.rec, are heavily dominated by a single category, reflecting the rarity of certain credit events among borrowers. The purpose variable shows a more diverse distribution, with debt consolidation being the most common loan reason. The target variable, not.fully.paid, is also highly imbalanced, with the majority of borrowers fully repaying their loans. These visualizations highlight the uneven distribution across categories and reinforce the need for techniques like SMOTE when training models sensitive to class imbalance.
+
+### Clustering
+
+```{r ClusteringPrepare, echo=TRUE}
+# Use only numeric columns for clustering
+cluster_data <- df[, c("int.rate", "installment", "log.annual.inc", 
+                       "dti", "fico", "days.with.cr.line", 
+                       "revol.bal", "revol.util")]
+
+# Scale numeric features
+cluster_scaled <- scale(cluster_data)
+```
+
+```{r ClusteringElbow, echo=TRUE, warning=FALSE}
+# For reproducibility
+set.seed(123)
+
+# Calculate WSS across k values to support elbow method
+wss <- sapply(1:10, function(k){
+  kmeans(cluster_scaled, centers = k, nstart = 20)$tot.withinss
+})
+
+# Elbow plot of WSS across k values
+plot(1:10, wss, type = "b",
+     xlab = "Number of Clusters (k)",
+     ylab = "Within-Cluster Sum of Squares",
+     main = "Elbow Method for Optimal k")
+```
+
+Using k‑means on scaled numeric features, the elbow method suggested k = 3 clusters. These clusters differ meaningfully in credit score, income, and revolving balance, indicating distinct borrower profiles. This insight supports the business understanding that loan applicants are heterogeneous and may respond differently to risk models.
+
+```{r ClusteringRun, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Run k-means with k = 3 clusters using multiple random starts
+k <- 3
+km_model <- kmeans(cluster_scaled, centers = k, nstart = 25)
+
+# Add cluster labels to original data
+df$cluster <- factor(km_model$cluster)
+```
+
+```{r ClusteringSummary, echo=TRUE}
+# Cluster-wise mean summary of numeric features
+aggregate(cluster_data, by = list(Cluster = df$cluster), mean)
+```
+
+``` {r PCA Identification, echo=TRUE}
+# Run PCA and summarize variance explained
+pca_model <- prcomp(df[, num_cols], scale. = TRUE)
+summary(pca_model)
+
+# Scree plot of PCA components
+plot(pca_model, type = "l", main = "Scree Plot of PCA Components")
+```
+
+## Data Preparation
+
+### Decision Tree
+
+```{r ConvertasFactor, echo=TRUE}
+# Convert selected variables to factors for the decision tree model
+df_dt <- df
+factor_cols <- c("credit.policy", "purpose", "not.fully.paid")
+df_dt[factor_cols] <- lapply(df_dt[factor_cols], as.factor)
+```
+
+### Logistic Regression
+
+```{r ConvertVariables, echo=TRUE}
+# Convert selected variables to factors for the logistic regression model
+df_lr <- df
+df_lr$not.fully.paid <- as.factor(df_lr$not.fully.paid)
+df_lr$purpose <- as.factor(df_lr$purpose)
+df_lr$credit.policy <- as.factor(df_lr$credit.policy)
+```
+
+### k-Nearest Neighbors
+
+```{r CreateDummyVariablesKNN, echo=TRUE}
+# Convert selected variables to factors for the kNN model
+df_knn <- df
+df_knn$not.fully.paid <- as.factor(df_knn$not.fully.paid)
+df_knn$credit.policy <- as.factor(df_knn$credit.policy)
+df_knn$purpose <- as.factor(df_knn$purpose)
+
+# Generate one-hot encoded predictors for kNN
+knn_x <- model.matrix(not.fully.paid ~ . - 1, data = df_knn)
+df_knn <- data.frame(not.fully.paid = df_knn$not.fully.paid, knn_x)
+```
+
+``` {r ConvertasFactor kNN, echo=TRUE}
+# Convert selected variables to factors for the kNN model
+df_knn$not.fully.paid <- as.factor(df_knn$not.fully.paid)
+```
+
+To prepare the data for modeling, I created three separate training datasets tailored to each algorithm family. Decision Trees and Random Forests require categorical variables as factors, Logistic Regression requires dummy‑encoded categorical variables and standardized numeric features, and kNN requires full numeric matrices with consistent scaling. This ensures that each model receives data in the format that maximizes its performance and stability.
+
+### Split Training/Testing Data
+
+```{r TrainTest, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Create Train/Test split
+train_index <- createDataPartition(df$not.fully.paid, p = 0.8, list = FALSE)
+
+train_dt  <- df_dt[train_index, ]
+test_dt   <- df_dt[-train_index, ]
+
+train_lr  <- df_lr[train_index, ]
+test_lr   <- df_lr[-train_index, ]
+
+train_knn <- df_knn[train_index, ]
+test_knn  <- df_knn[-train_index, ]
+```
+
+An 80/20 split was used to divide the data into training and testing sets. This ratio provides a strong balance between model learning and unbiased evaluation. Allocating 80% of the data to training ensures that each model—Decision Tree, Logistic Regression, and kNN—has enough observations to capture meaningful patterns, especially given the class imbalance in the target variable.
+
+```{r ScaleModels, echo=TRUE}
+### Logistic Regression Scaling
+num_cols_lr <- names(train_lr)[sapply(train_lr, is.numeric) & 
+                              names(train_lr) != "not.fully.paid"]
+
+train_means_lr <- sapply(train_lr[num_cols_lr], mean)
+train_sds_lr   <- sapply(train_lr[num_cols_lr], sd)
+
+train_lr[num_cols_lr] <- scale(train_lr[num_cols_lr],
+                               center = train_means_lr,
+                               scale = train_sds_lr)
+
+test_lr[num_cols_lr]  <- scale(test_lr[num_cols_lr],
+                               center = train_means_lr,
+                               scale = train_sds_lr)
+
+
+### kNN Scaling
+num_cols_knn <- names(train_knn)[sapply(train_knn, is.numeric) & 
+                                 names(train_knn) != "not.fully.paid"]
+
+train_means_knn <- sapply(train_knn[num_cols_knn], mean)
+train_sds_knn   <- sapply(train_knn[num_cols_knn], sd)
+
+train_knn[num_cols_knn] <- scale(train_knn[num_cols_knn],
+                                 center = train_means_knn,
+                                 scale = train_sds_knn)
+
+test_knn[num_cols_knn]  <- scale(test_knn[num_cols_knn],
+                                 center = train_means_knn,
+                                 scale = train_sds_knn)
+```
+
+Scaling was applied to the numeric predictors for both Logistic Regression and k‑Nearest Neighbors because these models are sensitive to differences in feature magnitude. Logistic Regression uses gradient‑based optimization, which converges more reliably when predictors share a common scale. kNN relies directly on distance calculations, so unscaled variables with large numeric ranges would dominate the distance metric and distort classification.
+
+```{r ValidationSplit, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Decision Tree
+val_idx_dt <- createDataPartition(train_dt$not.fully.paid, p = 0.8, list = FALSE)
+train_dt_sub <- train_dt[val_idx_dt, ]
+val_dt       <- train_dt[-val_idx_dt, ]
+
+# Logistic Regression
+val_idx_lr <- createDataPartition(train_lr$not.fully.paid, p = 0.8, list = FALSE)
+train_lr_sub <- train_lr[val_idx_lr, ]
+val_lr       <- train_lr[-val_idx_lr, ]
+
+# kNN
+val_idx_knn <- createDataPartition(train_knn$not.fully.paid, p = 0.8, list = FALSE)
+train_knn_sub <- train_knn[val_idx_knn, ]
+val_knn       <- train_knn[-val_idx_knn, ]
+```
+
+A separate validation split was created for each modeling approach to support hyperparameter tuning without touching the final test set. Using an 80% subset of the training data for model fitting and the remaining 20% for validation allows each algorithm—Decision Tree, Logistic Regression, and kNN—to be tuned fairly and independently.
+
+### Class Imbalance
+
+``` {r CheckClassImbalance, echo=TRUE}
+# Training set balance
+prop.table(table(train_lr$not.fully.paid))
+
+# Testing set balance
+prop.table(table(test_lr$not.fully.paid))
+```
+
+The class distribution in the training set shows that `r round(prop.table(table(train_lr$not.fully.paid))[1], 3)` of observations are fully paid and `r round(prop.table(table(train_lr$not.fully.paid))[2], 3)` are not fully paid, while the test set has a nearly identical split of `r round(prop.table(table(test_lr$not.fully.paid))[1], 3)` and `r round(prop.table(table(test_lr$not.fully.paid))[2], 3)`, respectively. Because createDataPartition preserves class proportions, both sets maintain the original imbalance of the target variable. This consistency ensures that model evaluation reflects real‑world conditions and highlights the need for imbalance‑aware techniques such as SMOTE and threshold tuning.
+
+```{r SMOTEApply, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Create preprocessing recipe that one‑hot encodes factors and oversamples the minority class using SMOTE
+smote_recipe <- recipe(not.fully.paid ~ ., data = train_lr_sub) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_smote(not.fully.paid, over_ratio = 1)
+
+# Prep the SMOTE recipe and bake the balanced training dataset
+smote_prep <- prep(smote_recipe)
+train_lr_smote <- bake(smote_prep, new_data = NULL)
+
+# Apply the same preprocessing to validation and test sets
+val_lr_prepped  <- bake(smote_prep, new_data = val_lr)
+test_lr_prepped <- bake(smote_prep, new_data = test_lr)
+```
+
+The target variable is highly imbalanced, with only ~16% of borrowers failing to fully repay. To address this, I applied SMOTE to the Logistic Regression dataset using a preprocessing recipe. SMOTE synthetically oversamples the minority class, improving the model’s ability to detect defaults. I applied the same preprocessing steps to validation and test sets to maintain consistency and avoid data leakage.
+
+## Single Prediction Models
+
+I trained multiple supervised learning models to compare their predictive performance. Each model was tuned using a separate validation split to avoid overfitting. The models include Decision Tree, GBM, Logistic Regression, Logistic Regression with SMOTE, and kNN. This diverse set of models provides a strong foundation for later ensemble construction.
+
+### Decision Tree
+
+``` {r SingleDecisionTreeModel, echo=TRUE}
+# Train decision tree model
+dt_model <- rpart(not.fully.paid ~ ., data = train_dt, method = "class")
+```
+
+``` {r TuneHyperparameters DT, echo=TRUE}
+# Define a sequence of cp values to test
+cp_values <- seq(0.001, 0.05, by = 0.002)
+
+# Store results
+results <- data.frame(cp = cp_values, accuracy = NA)
+
+# Loop through possible cp values
+for (i in seq_along(cp_values)) {
+  
+  # Train model with current cp
+  model <- rpart(not.fully.paid ~ ., data = train_dt,
+                 method = "class",
+                 control = rpart.control(cp = cp_values[i]))
+  
+  # Get predictions and accuracy metric
+  preds <- predict(model, val_dt, type = "class")
+  acc <- mean(preds == val_dt$not.fully.paid)
+  
+  # Store result
+  results$accuracy[i] <- acc
+}
+
+# Store best cp and accuracy metric
+best_cp <- results$cp[which.max(results$accuracy)]
+best_accuracy <- max(results$accuracy)
+```
+
+``` {r TunedSingleModel DT, echo=TRUE}
+# Train tuned decision tree model
+dt_final <- rpart(not.fully.paid ~ ., data = train_dt, method = "class",
+                  control = rpart.control(cp = best_cp))
+```
+
+### Boosted Model (GBM)
+
+```{r SingleGBMModel, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Convert train target to numeric 0/1 for GBM
+train_gbm <- train_dt
+train_gbm$not.fully.paid <- as.numeric(as.character(train_gbm$not.fully.paid))
+
+# Convert test target to numeric 0/1 for GBM
+test_gbm <- test_dt
+test_gbm$not.fully.paid <- as.numeric(as.character(test_gbm$not.fully.paid))
+
+# Train GBM model 
+gbm_model <- gbm(not.fully.paid ~ ., data = train_gbm, distribution = "bernoulli",
+                 n.trees = 300, interaction.depth = 3, shrinkage = 0.05,
+                 n.minobsinnode = 10, verbose = FALSE)
+```
+
+```{r FinalPrediction_GBM, echo=TRUE}
+# Get GBM probs and convert to predictions
+gbm_probs <- predict(gbm_model, test_gbm, type = "response", n.trees = 300)
+gbm_pred <- factor(ifelse(gbm_probs > 0.5, 1, 0), levels = c(0,1))
+```
+
+### Logistic Regression
+
+``` {r SingleLRModel, echo=TRUE}
+# Train logisitic regrssion model
+lr_model <- glm(not.fully.paid ~ ., data = train_lr, family = binomial)
+```
+
+```{r TuneHyperparameters_LR, echo=TRUE}
+# List of possible thresholds and results dataframe
+thresholds <- seq(0.05, 0.95, by = 0.05)
+lr_results <- data.frame(threshold = thresholds, F1 = NA)
+
+# Get probabilities from LR model
+probs <- predict(lr_model, val_lr, type = "response")
+
+# Loop through possible thresholds
+for (i in seq_along(thresholds)) {
+  
+  # Evaluate each threshold by converting probabilities to class predictions
+  t <- thresholds[i]
+  preds <- ifelse(probs > t, 1, 0)
+  
+  # Create confusion matrix
+  cm <- confusionMatrix(
+    factor(preds, levels = c(0, 1)),
+    factor(val_lr$not.fully.paid, levels = c("0", "1")),
+    positive = "1"
+  )
+  
+  # Calculate and store F1 metric
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  lr_results$F1[i] <- 2 * precision * recall / (precision + recall)
+}
+
+# Save best threshold
+best_thresh_lr <- lr_results$threshold[which.max(lr_results$F1)]
+```
+
+``` {r TunedSingleModel LR, echo=TRUE}
+# Train final logisitic regression model
+lr_final <- glm(not.fully.paid ~ ., data = train_lr, family = binomial)
+```
+
+### Logistic Regression (SMOTE)
+
+```{r SMOTE LRModel, echo=TRUE}
+# Train logistic regression SMOTE model
+lr_smote_model <- glm(not.fully.paid ~ ., data = train_lr_smote, family = binomial)
+```
+
+``` {r TuneHyperparameters LR SMOTE, echo=TRUE}
+# List of possible thresholds and results dataframe
+thresholds <- seq(0.05, 0.95, by = 0.05)
+lr_smote_results <- data.frame(threshold = thresholds, accuracy = NA)
+
+# Get probabilities from LR SMOTE model
+probs <- predict(lr_smote_model, val_lr_prepped, type = "response")
+
+# Loop through possible thresholds
+for (i in seq_along(thresholds)) {
+  
+  # Evaluate each threshold by converting probabilities to class predictions
+  t <- thresholds[i]
+  preds <- ifelse(probs > t, 1, 0)
+  
+  # Compute and save accuracies
+  acc <- mean(preds == val_lr_prepped$not.fully.paid)
+  lr_smote_results$accuracy[i] <- acc
+}
+
+best_thresh_smote <- lr_smote_results$threshold[which.max(lr_smote_results$accuracy)]
+```
+
+```{r SMOTE LRPredict, echo=TRUE}
+# Get probabilities and convert to predictions
+lr_smote_probs <- predict(lr_smote_model, test_lr_prepped, type = "response")
+lr_smote_pred <- ifelse(lr_smote_probs > best_thresh_smote, 1, 0)
+lr_smote_pred <- factor(lr_smote_pred, levels = c(0,1))
+```
+
+### k-Nearest Neighbors
+
+``` {r SinglekNNModel, echo=TRUE}
+# Extract kNN predictor matrix and align test predictors to the exact same feature set
+train_x <- train_knn[, !(names(train_knn) %in% "not.fully.paid")]
+test_x <- test_knn[, names(train_x)]
+val_x <- val_knn[, names(train_x)]
+```
+
+```{r TuneHyperparameters_KNN, echo=TRUE}
+# K-values and results dataframe
+k_values <- seq(3, 19, by = 2)
+knn_results <- data.frame(k = k_values, F1 = NA)
+
+# Loop through k-values
+for (i in seq_along(k_values)) {
+  
+  # Evaluate each k-value by getting predictions
+  k <- k_values[i]
+  preds <- knn(train = train_x, test = val_x, cl = train_knn$not.fully.paid, k = k)
+  
+  # Create confusion matrix
+  cm <- confusionMatrix(preds, val_knn$not.fully.paid, positive = "1")
+  
+  # Caluculate and save F1 score
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  knn_results$F1[i] <- 2 * precision * recall / (precision + recall)
+}
+
+# Save best k-value
+best_k <- knn_results$k[which.max(knn_results$F1)]
+```
+
+```{r TunedSingleModel_KNN, echo=TRUE}
+# Train tuned KNN model
+test_x <- test_knn[, names(train_x)]
+knn_pred <- knn(train = train_x, test = test_x, cl = train_knn$not.fully.paid, k = best_k)
+```
+
+### Evaluate Models
+
+``` {r GetPredictions, echo=TRUE}
+# Decision Tree
+dt_pred <- predict(dt_final, test_dt, type = "class")
+
+# Logistic Regression
+lr_probs <- predict(lr_final, test_lr, type = "response")
+lr_pred <- ifelse(lr_probs > best_thresh_lr, 1, 0)
+lr_pred <- factor(lr_pred, levels = c(0, 1))
+```
+
+```{r GetMetrics, echo=TRUE}
+# Function that calculates accuracy, precision, recall, and F1 score
+get_metrics <- function(pred, actual) {
+  pred <- factor(pred, levels = c("0", "1"))
+  actual <- factor(actual, levels = c("0", "1"))
+  cm <- confusionMatrix(pred, actual, positive = "1")
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  f1 <- 2 * precision * recall / (precision + recall)
+  c(Accuracy = cm$overall["Accuracy"], Precision = precision, Recall = recall, F1 = f1)
+}
+```
+
+```{r AccuracyTable, echo=TRUE}
+# Create accuracy table
+results_table <- rbind(
+  DecisionTree = get_metrics(dt_pred, test_dt$not.fully.paid),
+  LogisticRegression = get_metrics(lr_pred, test_lr$not.fully.paid),
+  SMOTE_Logistic = get_metrics(lr_smote_pred, test_lr$not.fully.paid),
+  GBM = get_metrics(gbm_pred, factor(test_gbm$not.fully.paid, levels = c(0, 1))),
+  kNN = get_metrics(knn_pred, test_knn$not.fully.paid)
+)
+
+knitr::kable(as.data.frame(results_table), digits = 4)
+```
+
+The performance comparison across the individual models shows substantial variation in how each algorithm handles the imbalanced default prediction task. The Decision Tree achieves an accuracy of `r round(results_table["DecisionTree","Accuracy.Accuracy"],4)`, but its recall of `r round(results_table["DecisionTree","Recall.Recall"],4)` indicates that it struggles to identify positive cases. Logistic Regression performs much better on recall, reaching `r round(results_table["LogisticRegression","Recall.Recall"],4)`, and produces the strongest F1 score at `r round(results_table["LogisticRegression","F1.Precision"],4)`, reflecting a more balanced trade‑off between precision and sensitivity. The SMOTE‑adjusted Logistic Regression model increases precision to `r round(results_table["SMOTE_Logistic","Precision.Precision"],4)`, but its recall drops sharply to `r round(results_table["SMOTE_Logistic","Recall.Recall"],4)`, showing that oversampling alone does not guarantee improved minority‑class detection. GBM delivers the highest accuracy at `r round(results_table["GBM","Accuracy.Accuracy"],4)`, though its recall remains low, while kNN provides a moderate balance with recall of `r round(results_table["kNN","Recall.Recall"],4)` and an F1 score of `r round(results_table["kNN","F1.Precision"],4)`. Overall, Logistic Regression offers the most effective balance among the single models, particularly in identifying default cases.
+
+## Homogenous Ensembles
+
+To improve predictive stability, I constructed homogeneous ensembles for Logistic Regression, kNN, and Random Forest. Each ensemble uses bootstrap sampling to generate multiple base learners and averages their predictions. This reduces variance and often improves minority‑class detection. Hyperparameters were tuned using validation F1 scores.
+
+### Random Forest
+
+```{r TuneHyperparameters RF, echo=TRUE}
+# Define possible mtry values
+mtry_values <- seq(2, ncol(train_dt) - 1, by = 2)
+
+# Store results
+rf_tune_results <- data.frame(mtry = mtry_values, F1 = NA)
+
+# Loop through mtry values
+for (i in seq_along(mtry_values)) {
+  
+  # For reproducibility
+  set.seed(123)
+  
+  # Build RF model
+  model <- randomForest(not.fully.paid ~ ., data = train_dt, ntree = 500,
+                        mtry = mtry_values[i])
+  
+  # Predict on validation set
+  preds <- predict(model, val_dt, type = "class")
+  
+  # Compute F1 on validation
+  actual <- factor(val_dt$not.fully.paid, levels = c("0", "1"))
+  preds  <- factor(preds, levels = c("0", "1"))
+  cm <- confusionMatrix(preds, actual, positive = "1")
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1        <- 2 * (precision * recall) / (precision + recall)
+  
+  # Store results
+  rf_tune_results$F1[i] <- f1
+}
+
+# Best mtry based on validation F1
+best_mtry <- rf_tune_results$mtry[which.max(rf_tune_results$F1)]
+best_f1   <- max(rf_tune_results$F1)
+```
+
+``` {r TunedHomogenousEnsemble RF, echo=TRUE}
+# Train final Random Forest with best mtry
+rf_final_he <- randomForest(not.fully.paid ~ ., data = train_dt, ntree = 500,
+                            mtry = best_mtry)
+
+# Final predictions
+rf_ensemble_pred <- predict(rf_final_he, test_dt, type = "class")
+```
+
+### Logistic Regression
+
+```{r HomogenousEnsemble_LR, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Set ensemble size, store training size, and create matrix to hold predictions
+n_models <- 50
+n_train_lr <- nrow(train_lr)
+lr_matrix <- matrix(NA, nrow = nrow(test_lr), ncol = n_models)
+
+# Loop through all models
+for (i in 1:n_models) {
+  
+  # Draw a bootstrap sample from the training data to create one LR ensemble dataset
+  boot_index <- sample(1:n_train_lr, replace = TRUE)
+  boot_data <- train_lr[boot_index, ]
+  
+  # Train LR on the bootstrap data and save model predicted probabilities
+  model <- glm(not.fully.paid ~ ., data = boot_data, family = binomial)
+  lr_matrix[, i] <- predict(model, test_lr, type = "response")
+}
+
+# Get average probability and create predictions
+lr_avg_probs <- rowMeans(lr_matrix)
+lr_ensemble_pred <- factor(ifelse(lr_avg_probs > 0.5, 1, 0), levels = c(0, 1))
+```
+
+```{r TuneHyperparameters LR HE, echo=TRUE}
+# List of thresholds and results dataframe
+thresholds <- seq(0.05, 0.95, by = 0.05)
+lr_results <- data.frame(threshold = thresholds, F1 = NA)
+
+# Compute validation probabilities for tuning
+val_probs <- rowMeans(replicate(n = 20,
+    {
+      # Draw a bootstrap sample from the training data to create one LR ensemble dataset
+      boot_index <- sample(1:n_train_lr, replace = TRUE)
+      boot_data <- train_lr[boot_index, ]
+      
+      # Train LR on the bootstrap data and save model predicted probabilities
+      model <- glm(not.fully.paid ~ ., data = boot_data, family = binomial)
+      predict(model, val_lr, type = "response")
+    }
+  )
+)
+
+# Loop through thresholds
+for (i in seq_along(thresholds)) {
+  
+  t <- thresholds[i]
+  
+  # Convert probabilities to class labels, then convert to factor
+  preds <- ifelse(val_probs > t, 1, 0)
+  preds <- factor(preds, levels = c(0, 1))
+  
+  # Get confusion matrix
+  cm <- confusionMatrix(preds, val_lr$not.fully.paid, positive = "1")
+  
+  # Calculate F1 score and store
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  
+  lr_results$F1[i] <- f1
+}
+
+# Save best threshold
+best_thresh_lr_he <- lr_results$threshold[which.max(lr_results$F1)]
+```
+
+```{r FinalPrediction LR HE, echo=TRUE}
+# Get final predictions
+lr_ensemble_pred <- ifelse(lr_avg_probs > best_thresh_lr_he, 1, 0)
+lr_ensemble_pred <- factor(lr_ensemble_pred, levels = c(0, 1))
+```
+
+
+### k-Nearest Neighbors
+
+```{r HomogenousEnsemble_KNN, echo=TRUE}
+# For reproducibility
+set.seed(123)
+
+# Set ensemble size, store training size, and create matrix to hold predictions
+n_models <- 20
+n_train_knn <- nrow(train_knn)
+preds_matrix <- matrix(NA, nrow = nrow(test_knn), ncol = n_models)
+
+# Loop through all models
+for (i in 1:n_models) {
+  
+  # Draw a bootstrap sample from the training data to create one LR ensemble dataset
+  boot_index <- sample(1:n_train_knn, replace = TRUE)
+  boot_data <- train_knn[boot_index, ]
+  
+  # Split bootstrap sample into predictor matrix and target vector for kNN model
+  boot_x <- boot_data[, !(names(boot_data) %in% "not.fully.paid")]
+  boot_y <- boot_data$not.fully.paid
+  
+  # Store this kNN model’s predictions in the ensemble matrix
+  preds_matrix[, i] <- as.numeric(knn(train = boot_x, test = test_x, cl = boot_y, k = best_k)) - 1
+}
+```
+
+```{r TuneHyperparameters KNN HE, echo=TRUE}
+# Loop through possible k-values
+for (j in seq_along(k_values)) {
+  
+  k <- k_values[j]
+  
+  # Matrix to store numeric predictions
+  preds_matrix <- matrix(NA, nrow = nrow(val_knn), ncol = n_models)
+  
+  # Loop through models
+  for (i in 1:n_models) {
+    
+    # Bootstrap sample
+    boot_index <- sample(1:n_train_knn, replace = TRUE)
+    boot_data  <- train_knn[boot_index, ]
+    
+    train_x <- boot_data[, !(names(boot_data) %in% "not.fully.paid")]
+    train_y <- boot_data$not.fully.paid
+    
+    # Validation feature matrix must match training columns
+    val_x <- val_knn[, names(train_x)]
+    
+    # Store this kNN model’s predictions in the ensemble matrix
+    preds_matrix[, i] <- as.numeric(knn(train = train_x, test = val_x, cl = train_y, k = k)) - 1
+  }
+  
+  # Probability averaging instead of majority vote
+  avg_prob <- rowMeans(preds_matrix)
+  final_preds <- ifelse(avg_prob > 0.5, 1, 0)
+  
+  # Evaluate F1 on validation set
+  actual <- factor(val_knn$not.fully.paid, levels = c("0", "1"))
+  preds  <- factor(final_preds,           levels = c("0", "1"))
+  
+  cm <- confusionMatrix(preds, actual, positive = "1")
+  
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1        <- 2 * (precision * recall) / (precision + recall)
+  
+  # Store F1 score
+  knn_results$F1[j] <- f1
+}
+
+# Best k based on validation F1
+best_k <- knn_results$k[which.max(knn_results$F1)]
+```
+
+```{r TunedHomogenousModel KNN, echo=TRUE}
+# Set ensemble size and create matrix to hold predictions
+n_models <- 20
+preds_matrix <- matrix(NA, nrow = nrow(test_knn), ncol = n_models)
+
+# Loop through all models
+for (i in 1:n_models) {
+  
+  # Draw a bootstrap sample from the training data to create one LR ensemble dataset
+  boot_index <- sample(1:n_train_knn, replace = TRUE)
+  boot_data  <- train_knn[boot_index, ]
+  
+  # Split bootstrap sample into predictor matrix and target vector for kNN model
+  train_x <- boot_data[, !(names(boot_data) %in% "not.fully.paid")]
+  train_y <- boot_data$not.fully.paid
+  
+  preds_matrix[, i] <- knn(train = train_x, test = test_x, cl = train_y, k = best_k)
+}
+
+# Convert to numeric probabilities ONLY
+knn_probs <- rowMeans(preds_matrix == "1")
+```
+
+```{r FinalPrediction KNN HE, echo=TRUE}
+# Final predictions
+knn_final_preds <- ifelse(knn_probs > 0.5, 1, 0)
+knn_ensemble_pred <- factor(knn_final_preds, levels = c(0,1))
+```
+
+### Evaluate Models
+
+``` {r AccuracyTable HE, echo=TRUE}
+# Create accuracy table for homogenous ensembles
+ensemble_results <- rbind(
+  RandomForest = get_metrics(rf_ensemble_pred, test_dt$not.fully.paid),
+  LogisticEnsemble = get_metrics(lr_ensemble_pred, test_lr$not.fully.paid),
+  kNNEnsemble = get_metrics(knn_ensemble_pred, test_knn$not.fully.paid))
+
+ensemble_results <- as.data.frame(ensemble_results)
+knitr::kable(ensemble_results, digits = 4)
+```
+
+The ensemble comparison shows clear differences in how each method balances precision and recall. The Random Forest ensemble achieves the highest accuracy at `r round(ensemble_results["RandomForest","Accuracy.Accuracy"],4)`, but its recall remains very low at `r round(ensemble_results["RandomForest","Recall.Recall"],4)`, indicating that it rarely identifies positive cases. The Logistic Regression ensemble provides a more balanced profile, with a substantially higher recall of `r round(ensemble_results["LogisticEnsemble","Recall.Recall"],4)` and the strongest F1 score at `r round(ensemble_results["LogisticEnsemble","F1.Precision"],4)`, though at the cost of reduced accuracy. The kNN ensemble shows the highest recall at `r round(ensemble_results["kNNEnsemble","Recall.Recall"],4)`, but its accuracy drops to `r round(ensemble_results["kNNEnsemble","Accuracy.Accuracy"],4)`, reflecting a tendency to over‑predict the minority class. Overall, the Logistic Regression ensemble provides the best trade‑off between identifying defaults and maintaining reasonable predictive stability.
+
+## Heterogenous Ensembles
+
+Finally, I built three heterogeneous ensembles that blend predictions from different model families. Weighted probability averaging was used, with weights tuned on the validation set to maximize F1. These ensembles combine complementary strengths: Logistic Regression’s recall, Random Forest’s accuracy, and kNN’s sensitivity to local structure. This approach often outperforms any single model.
+
+### Model 1
+
+```{r GetValidationProbs M1, echo=TRUE}
+# Align validation predictors for kNN, compute LR/RF validation probabilities, 
+val_x <- val_knn[, names(train_x)]
+val_lr_probs <- predict(lr_final, val_lr, type = "response")
+val_rf_probs <- predict(rf_final_he, val_dt, type = "prob")[, "1"]
+
+# Create matrix to store 20 kNN bootstrap predictions
+val_knn_matrix <- matrix(NA, nrow = nrow(val_knn), ncol = 20)
+
+for (i in 1:20) {
+  
+  # Draw a bootstrap sample of the kNN training data
+  boot_index <- sample(1:nrow(train_knn), replace = TRUE)
+  boot_data <- train_knn[boot_index, ]
+  
+  # Split bootstrap kNN sample into predictors (X) and target (y)
+  boot_x <- boot_data[, !(names(boot_data) %in% "not.fully.paid")]
+  boot_y <- boot_data$not.fully.paid
+  
+  # Generate this bootstrap kNN model’s validation predictions
+  val_knn_matrix[, i] <- as.numeric(knn(train = boot_x, test = val_x, cl = boot_y, k = best_k)) - 1
+}
+
+# Get KNN validation probabilities
+val_knn_probs <- rowMeans(val_knn_matrix)
+```
+
+```{r TuneWeights M1, echo=TRUE}
+# Create list of ensemble weights
+weights <- seq(0, 1, by = 0.05)
+
+# Create grid of all weight combinations for LR/RF/kNN and initialize F1 column
+results <- expand.grid(w_lr  = weights, w_rf  = weights, w_knn = weights)
+results$F1 <- NA
+
+# Set validation target as factor
+actual <- factor(val_lr$not.fully.paid, levels = c("0","1"))
+
+for (i in 1:nrow(results)) {
+  
+  # Extract the LR, RF, and kNN weights for this row of the grid
+  w1 <- results$w_lr[i]
+  w2 <- results$w_rf[i]
+  w3 <- results$w_knn[i]
+  
+  # Normalize weights
+  s <- w1 + w2 + w3
+  if (s == 0) next
+  w1 <- w1 / s; w2 <- w2 / s; w3 <- w3 / s
+  
+  # Weighted probability
+  blended <- w1*val_lr_probs + w2*val_rf_probs + w3*val_knn_probs
+  
+  # Convert to predictions 
+  preds <- ifelse(blended > 0.5, 1, 0)
+  preds <- factor(preds, levels = c("0","1"))
+  
+  # Calculate and store F1 score
+  cm <- confusionMatrix(preds, actual, positive = "1")
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1        <- 2*(precision*recall)/(precision+recall)
+  
+  results$F1[i] <- f1
+}
+
+# Get weights with best F1 score
+best_row <- results[which.max(results$F1), ]
+```
+
+```{r FinalPrediction M1, echo=TRUE}
+# Test probabilities
+test_lr_probs  <- lr_avg_probs
+test_rf_probs  <- predict(rf_final_he, test_dt, type = "prob")[, "1"]
+test_knn_probs <- knn_probs
+
+# Normalize weights
+s <- best_row$w_lr + best_row$w_rf + best_row$w_knn
+w1 <- best_row$w_lr  / s
+w2 <- best_row$w_rf  / s
+w3 <- best_row$w_knn / s
+
+# Weighted probability
+hetero_prob <- w1*test_lr_probs + w2*test_rf_probs + w3*test_knn_probs
+
+# Final prediction
+hetero_pred <- ifelse(hetero_prob > 0.5, 1, 0)
+hetero_pred <- factor(hetero_pred, levels = c("0","1"))
+```
+
+The heterogeneous ensemble combines the Logistic Regression ensemble, Random Forest ensemble, and kNN ensemble because each represents a strong but fundamentally different homogeneous learner. Logistic Regression contributes well‑calibrated linear probabilities, Random Forest captures nonlinear interactions and is robust to outliers, and kNN provides local, instance‑based behavior. Since these models learn different structures and make different types of errors, blending their ensemble probabilities increases diversity and improves overall stability and recall compared to relying on any single homogeneous ensemble alone.
+
+### Model 2
+
+``` {r GetValidationProbs M2, echo=TRUE}
+# Get model probabilities
+val_lr_single_probs <- predict(lr_final, val_lr, type = "response")
+val_knn_single_probs <- as.numeric(knn(train = train_x, test = val_x,
+                                       cl = train_knn$not.fully.paid, k = best_k)) - 1
+
+val_lr_smote_probs <- predict(lr_smote_model, val_lr_prepped, type = "response")
+```
+
+``` {r TuneWeights M2, echo=TRUE}
+# Create list of ensemble weights
+weights <- seq(0, 1, by = 0.05)
+
+# Create grid of all weight combinations for LR/KNN/SMOTE and initialize F1 column
+results_single <- expand.grid(w_lr = weights, w_knn = weights, w_lr_smote = weights)
+results_single$F1 <- NA
+
+# Set validation target as factor
+actual <- factor(val_lr$not.fully.paid, levels = c("0","1"))
+
+for (i in 1:nrow(results_single)) {
+  
+  # Extract the LR, KNN, and SMOTE weights for this row of the grid
+  w1 <- results_single$w_lr[i]
+  w2 <- results_single$w_knn[i]
+  w3 <- results_single$w_lr_smote[i]
+  
+  # Normalize weights
+  s <- w1 + w2 + w3
+  if (s == 0) next
+  w1 <- w1 / s; w2 <- w2 / s; w3 <- w3 / s
+  
+  # Weighted probability
+  blended <- w1*val_lr_single_probs + w2*val_knn_single_probs + w3*val_lr_smote_probs
+  
+  # Convert to predictions 
+  preds <- factor(ifelse(blended > 0.5, 1, 0), levels = c("0","1"))
+  
+  # Calculate and store F1 score
+  cm <- confusionMatrix(preds, actual, positive = "1")
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1        <- 2*(precision*recall)/(precision+recall)
+  
+  results_single$F1[i] <- f1
+}
+
+# Get weights with best F1 score
+best_row_single <- results_single[which.max(results_single$F1), ]
+```
+
+``` {r FinalPrediction M2, echo=TRUE}
+# Test probabilities
+test_lr_single_probs <- predict(lr_final, test_lr, type = "response")
+test_knn_single_probs <- as.numeric(knn(train = train_x, test = test_x,
+                                        cl = train_knn$not.fully.paid, k = best_k)) - 1
+
+test_lr_smote_probs <- predict(lr_smote_model, test_lr_prepped, type = "response")
+
+# Normalize weights
+s <- best_row_single$w_lr + best_row_single$w_knn + best_row_single$w_lr_smote
+
+w1 <- best_row_single$w_lr       / s
+w2 <- best_row_single$w_knn      / s
+w3 <- best_row_single$w_lr_smote / s
+
+# Final blended probability
+hetero_single_prob <- w1*test_lr_single_probs +
+                      w2*test_knn_single_probs +
+                      w3*test_lr_smote_probs
+
+# Convert to prediction
+hetero_single_pred <- factor(ifelse(hetero_single_prob > 0.5, 1, 0),
+                             levels = c("0","1"))
+```
+
+These three single models—Logistic Regression, kNN, and SMOTE‑Logistic Regression—were selected for the heterogeneous ensemble because they achieved the highest F1 scores among all individual models. Each model captures different patterns in the data, and because they excelled individually on the F1 metric, combining their probability outputs provides a strong, diverse foundation for improving overall recall and balanced performance.
+
+### Model 3
+
+``` {r GetValidationProbs M3, echo=TRUE}
+# Get model probabilities
+val_lr_probs <- predict(lr_final, val_lr, type = "response")
+val_rf_probs <- predict(rf_final_he, val_dt, type = "prob")[, "1"]
+val_lr_smote_probs <- predict(lr_smote_model, val_lr_prepped, type = "response")
+```
+
+``` {r TuneWeights M3, echo=TRUE}
+# Create list of ensemble weights
+weights <- seq(0, 1, by = 0.05)
+
+# Create grid of all weight combinations for LR/RF/SMOTE and initialize F1 column
+results_lr_rf_smote <- expand.grid(w_lr = weights, w_rf = weights, w_lr_smote = weights)
+results_lr_rf_smote$F1 <- NA
+
+# Set validation target as factor
+actual <- factor(val_lr$not.fully.paid, levels = c("0","1"))
+
+for (i in 1:nrow(results_lr_rf_smote)) {
+  
+  # Extract the LR, RF, and SMOTE weights for this row of the grid
+  w1 <- results_lr_rf_smote$w_lr[i]
+  w2 <- results_lr_rf_smote$w_rf[i]
+  w3 <- results_lr_rf_smote$w_lr_smote[i]
+  
+  # Normalize weights
+  s <- w1 + w2 + w3
+  if (s == 0) next
+  w1 <- w1 / s; w2 <- w2 / s; w3 <- w3 / s
+  
+  # Weighted probability
+  blended <- w1*val_lr_probs + w2*val_rf_probs + w3*val_lr_smote_probs
+  
+  # Convert to predictions 
+  preds <- factor(ifelse(blended > 0.5, 1, 0), levels = c("0","1"))
+  
+  # Calculate and store F1 score
+  cm <- confusionMatrix(preds, actual, positive = "1")
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1        <- 2*(precision*recall)/(precision+recall)
+  
+  
+  results_lr_rf_smote$F1[i] <- f1
+}
+
+# Get weights with best F1 score
+best_row_lr_rf_smote <- results_lr_rf_smote[which.max(results_lr_rf_smote$F1), ]
+```
+
+``` {r FinalPredictions M3, echo=TRUE}
+# Test probabilities
+test_lr_probs  <- predict(lr_final, test_lr, type = "response")
+test_rf_probs  <- predict(rf_final_he, test_dt, type = "prob")[, "1"]
+test_lr_smote_probs <- predict(lr_smote_model, test_lr_prepped, type = "response")
+
+# Normalize weights
+s <- best_row_lr_rf_smote$w_lr + best_row_lr_rf_smote$w_rf + best_row_lr_rf_smote$w_lr_smote
+
+w1 <- best_row_lr_rf_smote$w_lr       / s
+w2 <- best_row_lr_rf_smote$w_rf       / s
+w3 <- best_row_lr_rf_smote$w_lr_smote / s
+
+# Final blended probability
+hetero_lr_rf_smote_prob <- w1*test_lr_probs +
+                           w2*test_rf_probs +
+                           w3*test_lr_smote_probs
+
+# Convert to prediction
+hetero_lr_rf_smote_pred <- factor(ifelse(hetero_lr_rf_smote_prob > 0.5, 1, 0),
+                                  levels = c("0","1"))
+```
+
+This ensemble combines Logistic Regression, Random Forest, and SMOTE‑Logistic Regression because together they represent three fundamentally different modeling strategies: a linear model trained on the original data, a nonlinear tree‑based model, and a logistic model trained on a balanced dataset. These models capture different patterns in the predictors and respond differently to class imbalance, so blending their probability outputs increases diversity and improves overall robustness compared to relying on any single approach.
+
+### Evaluate Models
+
+```{r AccuracyTable Heterogeneous, echo=TRUE}
+# Create accuracy table for all heterogenous ensembles
+hetero_all_results <- rbind(
+  Hetero_LR_RF_KNN = get_metrics(hetero_pred, test_lr$not.fully.paid),
+  Hetero_LR_KNN_SMOTE = get_metrics(hetero_single_pred, test_lr$not.fully.paid),
+  Hetero_LR_RF_SMOTE = get_metrics(hetero_lr_rf_smote_pred, test_lr$not.fully.paid))
+
+hetero_all_results <- as.data.frame(hetero_all_results)
+knitr::kable(hetero_all_results, digits = 4,
+             caption = "Comparison of All Three Heterogeneous Ensembles")
+```
+
+## Model Comparison
+
+``` {r ModelComparison, echo=TRUE}
+# Create final accuracy table with all 11 models
+all_model_results <- rbind(
+  DecisionTree = get_metrics(dt_pred, test_dt$not.fully.paid),
+  LogisticRegression = get_metrics(lr_pred, test_lr$not.fully.paid),
+  SMOTE_Logistic = get_metrics(lr_smote_pred, test_lr$not.fully.paid),
+  GBM = get_metrics(gbm_pred, factor(test_gbm$not.fully.paid, levels = c(0,1))),
+  kNN = get_metrics(knn_ensemble_pred, test_knn$not.fully.paid),
+
+  RandomForest_Ensemble = get_metrics(rf_ensemble_pred, test_dt$not.fully.paid),
+  Logistic_Ensemble = get_metrics(lr_ensemble_pred, test_lr$not.fully.paid),
+  kNN_Ensemble = get_metrics(knn_ensemble_pred, test_knn$not.fully.paid),
+
+  Hetero_LR_RF_KNN = get_metrics(hetero_pred, test_lr$not.fully.paid),
+  Hetero_LR_KNN_SMOTE = get_metrics(hetero_single_pred, test_lr$not.fully.paid),
+  Hetero_LR_RF_SMOTE = get_metrics(hetero_lr_rf_smote_pred, test_lr$not.fully.paid))
+
+all_model_results <- as.data.frame(all_model_results)
+
+knitr::kable(all_model_results, digits = 4,
+             caption = "Comparison of All Single Models, Homogeneous Ensembles, and Heterogeneous Ensembles")
+```
+
+The full comparison across all single models, homogeneous ensembles, and heterogeneous ensembles highlights the trade‑offs each approach makes when predicting loan defaults. Among the single models, Logistic Regression provides the strongest balance, with an F1 score of `r round(all_model_results["LogisticRegression","F1.Precision"],4)` and a recall of `r round(all_model_results["LogisticRegression","Recall.Recall"],4)`, while GBM achieves the highest accuracy at `r round(all_model_results["GBM","Accuracy.Accuracy"],4)` but still struggles to identify positive cases. The homogeneous ensembles show similar patterns: the Random Forest ensemble reaches an accuracy of `r round(all_model_results["RandomForest_Ensemble","Accuracy.Accuracy"],4)`, yet its recall remains extremely low at `r round(all_model_results["RandomForest_Ensemble","Recall.Recall"],4)`, whereas the Logistic Regression ensemble maintains a more balanced recall of `r round(all_model_results["Logistic_Ensemble","Recall.Recall"],4)`. The heterogeneous ensembles offer modest improvements, with the LR–RF–kNN combination achieving the highest accuracy overall at `r round(all_model_results["Hetero_LR_RF_KNN","Accuracy.Accuracy"],4)`, though its recall remains limited. In contrast, the SMOTE‑based heterogeneous models improve recall to `r round(all_model_results["Hetero_LR_KNN_SMOTE","Recall.Recall"],4)`, but their precision and accuracy decline accordingly. Overall, the results show that no single model dominates across all metrics, but Logistic Regression–based approaches consistently provide the most balanced performance in detecting defaults.
