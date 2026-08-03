@@ -1,5 +1,10 @@
 # Loan Default Prediction Using Machine Learning
 
+## Project Report
+
+View the full interactive report here:
+https://eliashrs-1.github.io/loan-default-prediction/loan_default_prediction.html
+
 ## Overview
 
 This project develops a machine learning pipeline to predict loan defaults using the LendingClub loan dataset containing 9,578 borrower records. The goal was to build models that identify borrowers at higher risk of default while balancing the tradeoff between identifying defaults and minimizing false positives.
